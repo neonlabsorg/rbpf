@@ -105,9 +105,9 @@ pub enum ElfError {
     /// Offset or value is out of bounds
     #[error("Offset or value is out of bounds")]
     ValueOutOfBounds,
-    /// Dynamic stack frames detected but not enabled
-    #[error("Dynamic stack frames detected but not enabled")]
-    DynamicStackFramesDisabled,
+    /// Detected capabilities required by the executable which are not enabled
+    #[error("Detected capabilities required by the executable which are not enabled")]
+    UnsupportedExecutableCapabilities,
     /// Invalid program header
     #[error("Invalid ELF program header")]
     InvalidProgramHeader,
@@ -129,19 +129,20 @@ pub fn register_internal_function<
     C: ContextObject,
     T: AsRef<str> + ToString + std::cmp::PartialEq<&'static str>,
 >(
-    config: &Config,
     function_registry: &mut FunctionRegistry,
     loader: &BuiltInProgram<C>,
     pc: usize,
     name: T,
 ) -> Result<u32, ElfError> {
+    let config = loader.get_config();
     let key = if config.static_syscalls {
         // With static_syscalls normal function calls and syscalls are differentiated in the ISA.
         // Thus, we don't need to hash them here anymore and collisions are gone as well.
         pc as u32
     } else {
         let hash = hash_internal_function(pc, name.as_ref());
-        if config.syscall_internal_function_hash_collision && loader.lookup_function(hash).is_some()
+        if config.external_internal_function_hash_collision
+            && loader.lookup_function(hash).is_some()
         {
             return Err(ElfError::SymbolHashCollision(hash));
         }
@@ -265,8 +266,6 @@ pub(crate) enum Section {
 /// Elf loader/relocator
 #[derive(Debug)]
 pub struct Executable<C: ContextObject> {
-    /// Configuration settings
-    config: Config,
     /// Loaded and executable elf
     elf_bytes: AlignedMemory<{ HOST_ALIGN }>,
     /// Read-only section
@@ -281,13 +280,13 @@ pub struct Executable<C: ContextObject> {
     loader: Arc<BuiltInProgram<C>>,
     /// Compiled program and argument
     #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
-    compiled_program: RwLock<Option<JitProgram<C>>>,
+    compiled_program: RwLock<Option<JitProgram>>,
 }
 
 impl<C: ContextObject> Executable<C> {
     /// Get the configuration settings
     pub fn get_config(&self) -> &Config {
-        &self.config
+        self.loader.get_config()
     }
 
     /// Get the .text section virtual address and bytes
@@ -348,7 +347,7 @@ impl<C: ContextObject> Executable<C> {
 
     /// Get the JIT compiled program
     #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
-    pub fn get_compiled_program(&self) -> &RwLock<Option<JitProgram<C>>> {
+    pub fn get_compiled_program(&self) -> &RwLock<Option<JitProgram>> {
         &self.compiled_program
     }
 
@@ -367,12 +366,12 @@ impl<C: ContextObject> Executable<C> {
 
     /// Create from raw text section bytes (list of instructions)
     pub fn new_from_text_bytes(
-        config: Config,
         text_bytes: &[u8],
         loader: Arc<BuiltInProgram<C>>,
         mut function_registry: FunctionRegistry,
     ) -> Result<Self, ElfError> {
         let elf_bytes = AlignedMemory::from_slice(text_bytes);
+        let config = loader.get_config();
         let enable_symbol_and_section_labels = config.enable_symbol_and_section_labels;
         let entry_pc = if let Some((pc, _name)) = function_registry
             .values()
@@ -380,11 +379,10 @@ impl<C: ContextObject> Executable<C> {
         {
             *pc
         } else {
-            register_internal_function(&config, &mut function_registry, &loader, 0, "entrypoint")?;
+            register_internal_function(&mut function_registry, &loader, 0, "entrypoint")?;
             0
         };
         Ok(Self {
-            config,
             elf_bytes,
             ro_section: Section::Borrowed(0, 0..text_bytes.len()),
             text_section_info: SectionInfo {
@@ -405,12 +403,8 @@ impl<C: ContextObject> Executable<C> {
     }
 
     /// Fully loads an ELF, including validation and relocation
-    pub fn load(
-        config: Config,
-        bytes: &[u8],
-        loader: Arc<BuiltInProgram<C>>,
-    ) -> Result<Self, ElfError> {
-        if config.new_elf_parser {
+    pub fn load(bytes: &[u8], loader: Arc<BuiltInProgram<C>>) -> Result<Self, ElfError> {
+        if loader.get_config().new_elf_parser {
             // The new parser creates references from the input byte slice, so
             // it must be properly aligned. We assume that HOST_ALIGN is a
             // multiple of the ELF "natural" alignment. See test_load_unaligned.
@@ -421,21 +415,21 @@ impl<C: ContextObject> Executable<C> {
                 aligned = AlignedMemory::<{ HOST_ALIGN }>::from_slice(bytes);
                 aligned.as_slice()
             };
-            Self::load_with_parser(&NewParser::parse(bytes)?, config, bytes, loader)
+            Self::load_with_parser(&NewParser::parse(bytes)?, bytes, loader)
         } else {
-            Self::load_with_parser(&GoblinParser::parse(bytes)?, config, bytes, loader)
+            Self::load_with_parser(&GoblinParser::parse(bytes)?, bytes, loader)
         }
     }
 
     fn load_with_parser<'a, P: ElfParser<'a>>(
         elf: &'a P,
-        mut config: Config,
         bytes: &[u8],
         loader: Arc<BuiltInProgram<C>>,
     ) -> Result<Self, ElfError> {
         let mut elf_bytes = AlignedMemory::from_slice(bytes);
+        let config = loader.get_config();
 
-        Self::validate(&mut config, elf, elf_bytes.as_slice())?;
+        Self::validate(config, elf, elf_bytes.as_slice())?;
 
         // calculate the text section info
         let text_section = elf.section(".text")?;
@@ -474,7 +468,6 @@ impl<C: ContextObject> Executable<C> {
         // relocate symbols
         let mut function_registry = FunctionRegistry::default();
         Self::relocate(
-            &config,
             &mut function_registry,
             &loader,
             elf,
@@ -490,27 +483,20 @@ impl<C: ContextObject> Executable<C> {
             if !config.static_syscalls {
                 function_registry.remove(&ebpf::hash_symbol_name(b"entrypoint"));
             }
-            register_internal_function(
-                &config,
-                &mut function_registry,
-                &loader,
-                entry_pc,
-                "entrypoint",
-            )?;
+            register_internal_function(&mut function_registry, &loader, entry_pc, "entrypoint")?;
             entry_pc
         } else {
             return Err(ElfError::InvalidEntrypoint);
         };
 
         let ro_section = Self::parse_ro_sections(
-            &config,
+            config,
             elf.section_headers()
                 .map(|s| (elf.section_name(s.sh_name()), s)),
             elf_bytes.as_slice(),
         )?;
 
         Ok(Self {
-            config,
             elf_bytes,
             ro_section,
             text_section_info,
@@ -565,11 +551,11 @@ impl<C: ContextObject> Executable<C> {
 
     /// Fix-ups relative calls
     pub fn fixup_relative_calls(
-        config: &Config,
         function_registry: &mut FunctionRegistry,
         loader: &BuiltInProgram<C>,
         elf_bytes: &mut [u8],
     ) -> Result<(), ElfError> {
+        let config = loader.get_config();
         let instruction_count = elf_bytes
             .len()
             .checked_div(ebpf::INSN_SIZE)
@@ -595,7 +581,6 @@ impl<C: ContextObject> Executable<C> {
                 };
 
                 let key = register_internal_function(
-                    config,
                     function_registry,
                     loader,
                     target_pc as usize,
@@ -614,7 +599,7 @@ impl<C: ContextObject> Executable<C> {
 
     /// Validates the ELF
     pub fn validate<'a, P: ElfParser<'a>>(
-        config: &mut Config,
+        config: &Config,
         elf: &'a P,
         elf_bytes: &[u8],
     ) -> Result<(), ElfError> {
@@ -637,13 +622,14 @@ impl<C: ContextObject> Executable<C> {
 
         if header.e_flags == EF_SBF_V2 {
             if !config.dynamic_stack_frames {
-                return Err(ElfError::DynamicStackFramesDisabled);
+                return Err(ElfError::UnsupportedExecutableCapabilities);
             }
-        } else {
-            config.dynamic_stack_frames = false;
-            config.enable_elf_vaddr = false;
-            config.reject_rodata_stack_overlap = false;
-            config.static_syscalls = false;
+        } else if config.dynamic_stack_frames
+            && config.enable_elf_vaddr
+            && config.reject_rodata_stack_overlap
+            && config.static_syscalls
+        {
+            return Err(ElfError::UnsupportedExecutableCapabilities);
         }
 
         if config.enable_elf_vaddr {
@@ -880,7 +866,6 @@ impl<C: ContextObject> Executable<C> {
 
     /// Relocates the ELF in-place
     fn relocate<'a, P: ElfParser<'a>>(
-        config: &Config,
         function_registry: &mut FunctionRegistry,
         loader: &BuiltInProgram<C>,
         elf: &'a P,
@@ -891,7 +876,6 @@ impl<C: ContextObject> Executable<C> {
 
         // Fixup all program counter relative call instructions
         Self::fixup_relative_calls(
-            config,
             function_registry,
             loader,
             elf_bytes
@@ -899,6 +883,7 @@ impl<C: ContextObject> Executable<C> {
                 .ok_or(ElfError::ValueOutOfBounds)?,
         )?;
 
+        let config = loader.get_config();
         let mut program_header: Option<&<P as ElfParser<'a>>::ProgramHeader> = None;
 
         // Fixup all the relocations in the relocation section if exists
@@ -1096,13 +1081,7 @@ impl<C: ContextObject> Executable<C> {
                             as usize)
                             .checked_div(ebpf::INSN_SIZE)
                             .unwrap_or_default();
-                        register_internal_function(
-                            config,
-                            function_registry,
-                            loader,
-                            target_pc,
-                            name,
-                        )?
+                        register_internal_function(function_registry, loader, target_pc, name)?
                     } else {
                         // Else it's a syscall
                         let hash = *syscall_cache
@@ -1147,7 +1126,7 @@ impl<C: ContextObject> Executable<C> {
                 let name = elf
                     .symbol_name(symbol.st_name() as Elf64Word)
                     .ok_or_else(|| ElfError::UnknownSymbol(symbol.st_name() as usize))?;
-                register_internal_function(config, function_registry, loader, target_pc, name)?;
+                register_internal_function(function_registry, loader, target_pc, name)?;
             }
         }
 
@@ -1230,7 +1209,7 @@ mod test {
     type ElfExecutable = Executable<TestContextObject>;
 
     fn loader() -> Arc<BuiltInProgram<TestContextObject>> {
-        let mut loader = BuiltInProgram::default();
+        let mut loader = BuiltInProgram::new_loader(Config::default());
         loader
             .register_function_by_name("log", syscalls::bpf_syscall_string)
             .unwrap();
@@ -1246,7 +1225,7 @@ mod test {
         let elf = NewParser::parse(&elf_bytes).unwrap();
         let mut header = elf.header().clone();
 
-        let mut config = Config::default();
+        let config = Config::default();
 
         let write_header = |header: Elf64Ehdr| unsafe {
             let mut bytes = elf_bytes.clone();
@@ -1254,29 +1233,21 @@ mod test {
             bytes
         };
 
-        ElfExecutable::validate(&mut config, &elf, &elf_bytes).expect("validation failed");
+        ElfExecutable::validate(&config, &elf, &elf_bytes).expect("validation failed");
 
         header.e_ident.ei_class = ELFCLASS32;
         let bytes = write_header(header.clone());
         // the new parser rejects anything other than ELFCLASS64 directly
         NewParser::parse(&bytes).expect_err("allowed bad class");
-        ElfExecutable::validate(
-            &mut config,
-            &GoblinParser::parse(&bytes).unwrap(),
-            &elf_bytes,
-        )
-        .expect_err("allowed bad class");
+        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
+            .expect_err("allowed bad class");
 
         header.e_ident.ei_class = ELFCLASS64;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&mut config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
+        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
             .expect("validation failed");
-        ElfExecutable::validate(
-            &mut config,
-            &GoblinParser::parse(&bytes).unwrap(),
-            &elf_bytes,
-        )
-        .expect("validation failed");
+        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
+            .expect("validation failed");
 
         header.e_ident.ei_data = ELFDATA2MSB;
         let bytes = write_header(header.clone());
@@ -1285,69 +1256,45 @@ mod test {
 
         header.e_ident.ei_data = ELFDATA2LSB;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&mut config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
+        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
             .expect("validation failed");
-        ElfExecutable::validate(
-            &mut config,
-            &GoblinParser::parse(&bytes).unwrap(),
-            &elf_bytes,
-        )
-        .expect("validation failed");
+        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
+            .expect("validation failed");
 
         header.e_ident.ei_osabi = 1;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&mut config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
+        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
             .expect_err("allowed wrong abi");
-        ElfExecutable::validate(
-            &mut config,
-            &GoblinParser::parse(&bytes).unwrap(),
-            &elf_bytes,
-        )
-        .expect_err("allowed wrong abi");
+        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
+            .expect_err("allowed wrong abi");
 
         header.e_ident.ei_osabi = ELFOSABI_NONE;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&mut config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
+        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
             .expect("validation failed");
-        ElfExecutable::validate(
-            &mut config,
-            &GoblinParser::parse(&bytes).unwrap(),
-            &elf_bytes,
-        )
-        .expect("validation failed");
+        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
+            .expect("validation failed");
 
         header.e_machine = 42;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&mut config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
+        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
             .expect_err("allowed wrong machine");
-        ElfExecutable::validate(
-            &mut config,
-            &GoblinParser::parse(&bytes).unwrap(),
-            &elf_bytes,
-        )
-        .expect_err("allowed wrong machine");
+        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
+            .expect_err("allowed wrong machine");
 
         header.e_machine = EM_BPF;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&mut config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
+        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
             .expect("validation failed");
-        ElfExecutable::validate(
-            &mut config,
-            &GoblinParser::parse(&bytes).unwrap(),
-            &elf_bytes,
-        )
-        .expect("validation failed");
+        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
+            .expect("validation failed");
 
         header.e_type = ET_REL;
         let bytes = write_header(header);
-        ElfExecutable::validate(&mut config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
+        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
             .expect_err("allowed wrong type");
-        ElfExecutable::validate(
-            &mut config,
-            &GoblinParser::parse(&bytes).unwrap(),
-            &elf_bytes,
-        )
-        .expect_err("allowed wrong type");
+        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
+            .expect_err("allowed wrong type");
     }
 
     #[test]
@@ -1356,7 +1303,7 @@ mod test {
         let mut elf_bytes = Vec::new();
         file.read_to_end(&mut elf_bytes)
             .expect("failed to read elf file");
-        ElfExecutable::load(Config::default(), &elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
     }
 
     #[test]
@@ -1366,8 +1313,7 @@ mod test {
         // elf_bytes.as_ptr() + 1 to make it unaligned and test unaligned
         // parsing.
         elf_bytes.insert(0, 0);
-        ElfExecutable::load(Config::default(), &elf_bytes[1..], loader())
-            .expect("validation failed");
+        ElfExecutable::load(&elf_bytes[1..], loader()).expect("validation failed");
     }
 
     #[test]
@@ -1378,8 +1324,7 @@ mod test {
         let mut elf_bytes = Vec::new();
         file.read_to_end(&mut elf_bytes)
             .expect("failed to read elf file");
-        let elf = ElfExecutable::load(Config::default(), &elf_bytes, loader.clone())
-            .expect("validation failed");
+        let elf = ElfExecutable::load(&elf_bytes, loader.clone()).expect("validation failed");
         let parsed_elf = NewParser::parse(&elf_bytes).unwrap();
         let executable: &Executable<TestContextObject> = &elf;
         assert_eq!(0, executable.get_entrypoint_instruction_offset());
@@ -1395,8 +1340,7 @@ mod test {
 
         header.e_entry += 8;
         let elf_bytes = write_header(header.clone());
-        let elf = ElfExecutable::load(Config::default(), &elf_bytes, loader.clone())
-            .expect("validation failed");
+        let elf = ElfExecutable::load(&elf_bytes, loader.clone()).expect("validation failed");
         let executable: &Executable<TestContextObject> = &elf;
         assert_eq!(1, executable.get_entrypoint_instruction_offset());
 
@@ -1404,40 +1348,38 @@ mod test {
         let elf_bytes = write_header(header.clone());
         assert_eq!(
             Err(ElfError::EntrypointOutOfBounds),
-            ElfExecutable::load(Config::default(), &elf_bytes, loader.clone())
+            ElfExecutable::load(&elf_bytes, loader.clone())
         );
 
         header.e_entry = u64::MAX;
         let elf_bytes = write_header(header.clone());
         assert_eq!(
             Err(ElfError::EntrypointOutOfBounds),
-            ElfExecutable::load(Config::default(), &elf_bytes, loader.clone())
+            ElfExecutable::load(&elf_bytes, loader.clone())
         );
 
         header.e_entry = initial_e_entry + ebpf::INSN_SIZE as u64 + 1;
         let elf_bytes = write_header(header.clone());
         assert_eq!(
             Err(ElfError::InvalidEntrypoint),
-            ElfExecutable::load(Config::default(), &elf_bytes, loader.clone())
+            ElfExecutable::load(&elf_bytes, loader.clone())
         );
 
         header.e_entry = initial_e_entry;
         let elf_bytes = write_header(header);
-        let elf =
-            ElfExecutable::load(Config::default(), &elf_bytes, loader).expect("validation failed");
+        let elf = ElfExecutable::load(&elf_bytes, loader).expect("validation failed");
         let executable: &Executable<TestContextObject> = &elf;
         assert_eq!(0, executable.get_entrypoint_instruction_offset());
     }
 
     #[test]
     fn test_fixup_relative_calls_back() {
-        let config = Config {
+        let mut function_registry = FunctionRegistry::default();
+        let loader = BuiltInProgram::new_loader(Config {
             static_syscalls: false,
             enable_symbol_and_section_labels: true,
             ..Config::default()
-        };
-        let mut function_registry = FunctionRegistry::default();
-        let loader = BuiltInProgram::default();
+        });
 
         // call -2
         #[rustfmt::skip]
@@ -1449,8 +1391,7 @@ mod test {
             0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x85, 0x10, 0x00, 0x00, 0xfe, 0xff, 0xff, 0xff];
 
-        ElfExecutable::fixup_relative_calls(&config, &mut function_registry, &loader, &mut prog)
-            .unwrap();
+        ElfExecutable::fixup_relative_calls(&mut function_registry, &loader, &mut prog).unwrap();
         let name = "function_4".to_string();
         let hash = hash_internal_function(4, &name);
         let insn = ebpf::Insn {
@@ -1466,8 +1407,7 @@ mod test {
         // call +6
         let mut function_registry = FunctionRegistry::default();
         prog.splice(44.., vec![0xfa, 0xff, 0xff, 0xff]);
-        ElfExecutable::fixup_relative_calls(&config, &mut function_registry, &loader, &mut prog)
-            .unwrap();
+        ElfExecutable::fixup_relative_calls(&mut function_registry, &loader, &mut prog).unwrap();
         let name = "function_0".to_string();
         let hash = hash_internal_function(0, &name);
         let insn = ebpf::Insn {
@@ -1483,13 +1423,12 @@ mod test {
 
     #[test]
     fn test_fixup_relative_calls_forward() {
-        let config = Config {
+        let mut function_registry = FunctionRegistry::default();
+        let loader = BuiltInProgram::new_loader(Config {
             static_syscalls: false,
             enable_symbol_and_section_labels: true,
             ..Config::default()
-        };
-        let mut function_registry = FunctionRegistry::default();
-        let loader = BuiltInProgram::default();
+        });
 
         // call +0
         #[rustfmt::skip]
@@ -1501,8 +1440,7 @@ mod test {
             0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-        ElfExecutable::fixup_relative_calls(&config, &mut function_registry, &loader, &mut prog)
-            .unwrap();
+        ElfExecutable::fixup_relative_calls(&mut function_registry, &loader, &mut prog).unwrap();
         let name = "function_1".to_string();
         let hash = hash_internal_function(1, &name);
         let insn = ebpf::Insn {
@@ -1518,8 +1456,7 @@ mod test {
         // call +4
         let mut function_registry = FunctionRegistry::default();
         prog.splice(4..8, vec![0x04, 0x00, 0x00, 0x00]);
-        ElfExecutable::fixup_relative_calls(&config, &mut function_registry, &loader, &mut prog)
-            .unwrap();
+        ElfExecutable::fixup_relative_calls(&mut function_registry, &loader, &mut prog).unwrap();
         let name = "function_5".to_string();
         let hash = hash_internal_function(5, &name);
         let insn = ebpf::Insn {
@@ -1538,9 +1475,8 @@ mod test {
         expected = "called `Result::unwrap()` on an `Err` value: RelativeJumpOutOfBounds(29)"
     )]
     fn test_fixup_relative_calls_out_of_bounds_forward() {
-        let config = Config::default();
         let mut function_registry = FunctionRegistry::default();
-        let loader = BuiltInProgram::default();
+        let loader = loader();
 
         // call +5
         #[rustfmt::skip]
@@ -1552,8 +1488,7 @@ mod test {
             0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-        ElfExecutable::fixup_relative_calls(&config, &mut function_registry, &loader, &mut prog)
-            .unwrap();
+        ElfExecutable::fixup_relative_calls(&mut function_registry, &loader, &mut prog).unwrap();
         let name = "function_1".to_string();
         let hash = hash_internal_function(1, &name);
         let insn = ebpf::Insn {
@@ -1572,9 +1507,8 @@ mod test {
         expected = "called `Result::unwrap()` on an `Err` value: RelativeJumpOutOfBounds(34)"
     )]
     fn test_fixup_relative_calls_out_of_bounds_back() {
-        let config = Config::default();
         let mut function_registry = FunctionRegistry::default();
-        let loader = BuiltInProgram::default();
+        let loader = loader();
 
         // call -7
         #[rustfmt::skip]
@@ -1586,8 +1520,7 @@ mod test {
             0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x85, 0x10, 0x00, 0x00, 0xf9, 0xff, 0xff, 0xff];
 
-        ElfExecutable::fixup_relative_calls(&config, &mut function_registry, &loader, &mut prog)
-            .unwrap();
+        ElfExecutable::fixup_relative_calls(&mut function_registry, &loader, &mut prog).unwrap();
         let name = "function_4".to_string();
         let hash = hash_internal_function(4, &name);
         let insn = ebpf::Insn {
@@ -1604,7 +1537,7 @@ mod test {
     #[test]
     #[ignore]
     fn test_fuzz_load() {
-        let loader = Arc::new(BuiltInProgram::default());
+        let loader = loader();
 
         // Random bytes, will mostly fail due to lack of ELF header so just do a few
         let mut rng = rand::thread_rng();
@@ -1612,7 +1545,7 @@ mod test {
         println!("random bytes");
         for _ in 0..1_000 {
             let elf_bytes: Vec<u8> = (0..100).map(|_| rng.sample(range)).collect();
-            let _ = ElfExecutable::load(Config::default(), &elf_bytes, loader.clone());
+            let _ = ElfExecutable::load(&elf_bytes, loader.clone());
         }
 
         // Take a real elf and mangle it
@@ -1632,7 +1565,7 @@ mod test {
             0..parsed_elf.header().e_ehsize as usize,
             0..255,
             |bytes: &mut [u8]| {
-                let _ = ElfExecutable::load(Config::default(), bytes, loader.clone());
+                let _ = ElfExecutable::load(bytes, loader.clone());
             },
         );
 
@@ -1645,7 +1578,7 @@ mod test {
             parsed_elf.header().e_shoff as usize..elf_bytes.len(),
             0..255,
             |bytes: &mut [u8]| {
-                let _ = ElfExecutable::load(Config::default(), bytes, loader.clone());
+                let _ = ElfExecutable::load(bytes, loader.clone());
             },
         );
 
@@ -1658,7 +1591,7 @@ mod test {
             0..elf_bytes.len(),
             0..255,
             |bytes: &mut [u8]| {
-                let _ = ElfExecutable::load(Config::default(), bytes, loader.clone());
+                let _ = ElfExecutable::load(bytes, loader.clone());
             },
         );
     }
@@ -2147,7 +2080,7 @@ mod test {
     fn test_writable_data_section() {
         let elf_bytes =
             std::fs::read("tests/elfs/writable_data_section.so").expect("failed to read elf file");
-        ElfExecutable::load(Config::default(), &elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
     }
 
     #[test]
@@ -2155,26 +2088,22 @@ mod test {
     fn test_bss_section() {
         let elf_bytes =
             std::fs::read("tests/elfs/bss_section.so").expect("failed to read elf file");
-        ElfExecutable::load(Config::default(), &elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
     }
 
     #[test]
     #[should_panic(expected = r#"validation failed: RelativeJumpOutOfBounds(29)"#)]
     fn test_static_syscall_disabled() {
+        let loader = BuiltInProgram::new_loader(Config {
+            static_syscalls: false,
+            ..Config::default()
+        });
         let elf_bytes =
             std::fs::read("tests/elfs/syscall_static_unknown.so").expect("failed to read elf file");
 
         // when config.static_syscalls=false, all CALL_IMMs are treated as relative
         // calls for backwards compatibility
-        ElfExecutable::load(
-            Config {
-                static_syscalls: false,
-                ..Config::default()
-            },
-            &elf_bytes,
-            loader(),
-        )
-        .expect("validation failed");
+        ElfExecutable::load(&elf_bytes, Arc::new(loader)).expect("validation failed");
     }
 
     #[test]
@@ -2182,7 +2111,7 @@ mod test {
     fn test_program_headers_overflow() {
         let elf_bytes = std::fs::read("tests/elfs/program_headers_overflow.so")
             .expect("failed to read elf file");
-        ElfExecutable::load(Config::default(), &elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
     }
 
     #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
@@ -2192,8 +2121,8 @@ mod test {
         let mut elf_bytes = Vec::new();
         file.read_to_end(&mut elf_bytes)
             .expect("failed to read elf file");
-        let mut executable = ElfExecutable::from_elf(&elf_bytes, Config::default(), loader())
-            .expect("validation failed");
+        let mut executable =
+            ElfExecutable::from_elf(&elf_bytes, loader()).expect("validation failed");
         {
             Executable::jit_compile(&mut executable).unwrap();
         }

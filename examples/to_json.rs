@@ -14,7 +14,7 @@ extern crate solana_rbpf;
 use solana_rbpf::{
     elf::Executable,
     static_analysis::Analysis,
-    vm::{BuiltInProgram, Config, FunctionRegistry, TestContextObject},
+    vm::{BuiltInProgram, FunctionRegistry, TestContextObject},
 };
 use std::sync::Arc;
 // Turn a program into a JSON string.
@@ -27,16 +27,13 @@ use std::sync::Arc;
 // * Print integers as integers, and not as strings containing their hexadecimal representation
 //   (just replace the relevant `format!()` calls by the commented values.
 fn to_json(program: &[u8]) -> String {
-    let executable = Arc::new(
-        Executable::<TestContextObject>::from_text_bytes(
-            program,
-            Config::default(),
-            Arc::new(BuiltInProgram::default()),
-            FunctionRegistry::default(),
-        )
-        .unwrap(),
-    );
-    let analysis = Analysis::from_executable(executable).unwrap();
+    let executable = Executable::<TestContextObject>::from_text_bytes(
+        program,
+        Arc::new(BuiltInProgram::default()),
+        FunctionRegistry::default(),
+    )
+    .unwrap();
+    let analysis = Analysis::from_executable(Arc::new(executable)).unwrap();
 
     let mut json_insns = vec![];
     for insn in analysis.instructions.iter() {
