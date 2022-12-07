@@ -37,7 +37,7 @@ pub struct JitProgram<C: ContextObject> {
     pc_section: &'static mut [usize],
     /// The x86 machinecode
     text_section: &'static mut [u8],
-    _marker: PhantomData<C>,
+    _marker: PhantomData<fn(C)>,
 }
 
 impl<C: ContextObject> JitProgram<C> {
