@@ -123,6 +123,16 @@ impl<'a, 'b, V: Verifier, C: ContextObject> Interpreter<'a, 'b, V, C> {
                 .get_text_section_offset()
     }
 
+    /// VM
+    pub fn vm(&mut self) -> &mut &'a mut EbpfVm<'b, V, C> {
+        &mut self.vm
+    }
+
+    /// due insn count
+    pub fn due_insn_count(&self) -> u64 {
+        self.due_insn_count
+    }
+
     fn push_frame(&mut self, config: &Config) -> bool {
         let frame = &mut self.vm.env.call_frames[self.vm.env.call_depth as usize];
         frame.caller_saved_registers.copy_from_slice(
